@@ -1,0 +1,132 @@
+diff --git a/Bender.yml b/Bender.yml
+index 7fa1451..7f09c41 100644
+--- a/Bender.yml
++++ b/Bender.yml
+@@ -47,8 +47,10 @@ dependencies:
+   udma_hyper:             { git: "https://github.com/pulp-platform/udma_hyper.git", rev: "83ab704f9d1c5f9e5353268c901fe95c36bcea36" }
+   hwpe-mac-engine:        { git: "https://github.com/pulp-platform/hwpe-mac-engine.git", version: 1.3.3 }
+   riscv-dbg:              { git: "https://github.com/pulp-platform/riscv-dbg.git", version: 0.4.1 }
++  wide_alu:               { git: "https://github.com/pulp-soc-training/wide_alu.git", rev: "31801a704b1121abc1d6fa2007a30fe3dcf7ce4a" }
+   register_interface:     { git: "https://github.com/pulp-platform/register_interface.git", version: 0.3.1 }
+ 
++  
+ sources:
+   # pulp_soc
+   - include_dirs:
+diff --git a/rtl/pulp_soc/periph_bus_wrap.sv b/rtl/pulp_soc/periph_bus_wrap.sv
+index 583cdfe..c58917a 100644
+--- a/rtl/pulp_soc/periph_bus_wrap.sv
++++ b/rtl/pulp_soc/periph_bus_wrap.sv
+@@ -28,7 +28,8 @@ module periph_bus_wrap #(
+     APB_BUS.Master mmap_debug_master,
+     APB_BUS.Master timer_master,
+     APB_BUS.Master hwpe_master,
+-    APB_BUS.Master stdout_master
++    APB_BUS.Master stdout_master,
++    APB_BUS.Master wide_alu_master
+ );
+ 
+     localparam NB_MASTER = `NB_MASTER;
+@@ -94,6 +95,10 @@ module periph_bus_wrap #(
+     assign s_start_addr[10] = `DEBUG_START_ADDR;
+     assign s_end_addr[10]   = `DEBUG_END_ADDR;
+ 
++    `APB_ASSIGN_MASTER(s_masters[11], wide_alu_master);
++    assign s_start_addr[11] = `WIDE_ALU_START_ADDR;
++    assign s_end_addr[11]   = `WIDE_ALU_END_ADDR;
++
+     //********************************************************
+     //**************** SOC BUS *******************************
+     //********************************************************
+diff --git a/rtl/pulp_soc/soc_interconnect.sv b/rtl/pulp_soc/soc_interconnect.sv
+index cd3cd58..398ba6e 100644
+--- a/rtl/pulp_soc/soc_interconnect.sv
++++ b/rtl/pulp_soc/soc_interconnect.sv
+@@ -69,7 +69,7 @@ module soc_interconnect
+                                                                                                 //at least clog2(NR_AXI_SLAVES)
+      );
+ 
+-
++   
+     // Internal Parameters
+     // Do **NOT** change
+     localparam int unsigned BUS_DATA_WIDTH = 32;
+diff --git a/rtl/pulp_soc/soc_peripherals.sv b/rtl/pulp_soc/soc_peripherals.sv
+index 5f4a838..f6831a5 100644
+--- a/rtl/pulp_soc/soc_peripherals.sv
++++ b/rtl/pulp_soc/soc_peripherals.sv
+@@ -9,6 +9,8 @@
+ // specific language governing permissions and limitations under the License.
+ 
+ `include "pulp_soc_defines.sv"
++`include "register_interface/typedef.svh"
++`include "register_interface/assign.svh"
+ 
+ module soc_peripherals #(
+     parameter MEM_ADDR_WIDTH = 13,
+@@ -176,7 +178,13 @@ module soc_peripherals #(
+     APB_BUS s_soc_evnt_gen_bus ();
+     APB_BUS s_stdout_bus ();
+     APB_BUS s_apb_timer_bus ();
++    APB_BUS s_wide_alu();
+ 
++    REG_BUS #(
++              .ADDR_WIDTH(8),
++              .DATA_WIDTH(32)
++              ) wide_alu_reg_bus(.clk_i(clk_i));
++   
+     localparam UDMA_EVENTS = 16*8;
+ 
+     logic [31:0] s_gpio_sync;
+@@ -285,9 +293,50 @@ module soc_peripherals #(
+         .mmap_debug_master   ( apb_debug_master   ),
+         .hwpe_master         ( apb_hwpe_master    ),
+         .timer_master        ( s_apb_timer_bus    ),
+-        .stdout_master       ( s_stdout_bus       )
++        .stdout_master       ( s_stdout_bus       ),
++        .wide_alu_master     ( s_wide_alu         )
+     );
+ 
++    localparam RegAw  = 8;
++    localparam RegDw  = 32; 
++    typedef logic [RegAw-1:0]   reg_addr_t;
++    typedef logic [RegDw-1:0]   reg_data_t;
++    typedef logic [RegDw/8-1:0] reg_strb_t;   
++    `REG_BUS_TYPEDEF_REQ(reg_req_t, reg_addr_t, reg_data_t, reg_strb_t)
++    `REG_BUS_TYPEDEF_RSP(reg_rsp_t, reg_data_t)   
++    reg_req_t   reg_req;
++    reg_rsp_t   reg_rsp;
++    `REG_BUS_ASSIGN_TO_REQ(reg_req,wide_alu_reg_bus)
++    `REG_BUS_ASSIGN_FROM_RSP(wide_alu_reg_bus,reg_rsp)   
++
++    apb_to_reg i_apb_to_wide_alu
++    (
++     .clk_i     ( clk_i              ),
++     .rst_ni    ( rst_ni             ),
++    
++     .penable_i ( s_wide_alu.penable ),
++     .pwrite_i  ( s_wide_alu.pwrite  ),
++     .paddr_i   ( s_wide_alu.paddr   ),
++     .psel_i    ( s_wide_alu.psel    ),
++     .pwdata_i  ( s_wide_alu.pwdata  ),
++     .prdata_o  ( s_wide_alu.prdata  ),
++     .pready_o  ( s_wide_alu.pready  ),
++     .pslverr_o ( s_wide_alu.pslverr ),
++    
++     .reg_o     ( wide_alu_reg_bus   )
++    );
++   
++       wide_alu_top #(
++                     .reg_req_t (reg_req_t),
++                     .reg_rsp_t (reg_rsp_t)
++                     ) i_wide_alu_top (
++                                       .clk_i(clk_i),
++                                       .rst_ni(rst_ni),
++                                       .reg_req_i(reg_req),
++                                       .reg_rsp_o(reg_rsp)
++                                       );
++   
++   
+     `ifdef SYNTHESIS
+         assign s_stdout_bus.pready  = 'h0;
+         assign s_stdout_bus.pslverr = 'h0;

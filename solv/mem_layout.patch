@@ -1,0 +1,204 @@
+diff --git a/rtl/pulp_soc/l2_ram_multi_bank.sv b/rtl/pulp_soc/l2_ram_multi_bank.sv
+index 8dce52e..89f94aa 100644
+--- a/rtl/pulp_soc/l2_ram_multi_bank.sv
++++ b/rtl/pulp_soc/l2_ram_multi_bank.sv
+@@ -19,15 +19,18 @@ module l2_ram_multi_bank #(
+    input logic             init_ni,
+    input logic             test_mode_i,
+    XBAR_TCDM_BUS.Slave     mem_slave[NB_BANKS],
+-   XBAR_TCDM_BUS.Slave     mem_pri_slave[2]
++   XBAR_TCDM_BUS.Slave     mem_pri_slave[2],
++   XBAR_TCDM_BUS.Slave     additional_mem_pri_slave
+ );
+     localparam int unsigned BANK_SIZE_PRI0       = 8192; //Number of 32-bit words
+     localparam int unsigned BANK_SIZE_PRI1       = 8192; //Number of 32-bit words
++    localparam int unsigned BANK_SIZE_PRI2       = 8192; //Number of 32-bit words
+ 
+     //Derived parameters
+     localparam int unsigned INTL_MEM_ADDR_WIDTH = $clog2(BANK_SIZE_INTL_SRAM);
+     localparam int unsigned PRI0_MEM_ADDR_WIDTH = $clog2(BANK_SIZE_PRI0);
+     localparam int unsigned PRI1_MEM_ADDR_WIDTH = $clog2(BANK_SIZE_PRI1);
++    localparam int unsigned PRI2_MEM_ADDR_WIDTH = $clog2(BANK_SIZE_PRI2);
+ 
+     //Used in testbenches
+ 
+@@ -129,5 +132,36 @@ module l2_ram_multi_bank #(
+       .rdata_o (  mem_pri_slave[1].r_rdata              )
+     );
+ 
++    // PRIVATE BANK2
++    //Perform TCDM handshaking for constant 1 cycle latency
++    assign additional_mem_pri_slave.gnt = additional_mem_pri_slave.req;
++    assign additional_mem_pri_slave.r_opc = 1'b0;
++    always_ff @(posedge clk_i, negedge rst_ni) begin
++        if (!rst_ni) begin
++            additional_mem_pri_slave.r_valid <= 1'b0;
++        end else begin
++            additional_mem_pri_slave.r_valid <= additional_mem_pri_slave.req;
++        end
++    end
++    //Remove Address offset
++    logic [31:0] pri2_address;
++    assign pri2_address = additional_mem_pri_slave.add - `SOC_MEM_MAP_PRIVATE_BANK2_START_ADDR;
++
++    tc_sram #(
++      .NumWords  ( BANK_SIZE_PRI2 ),
++      .DataWidth ( 32             ),
++      .NumPorts  ( 1              ),
++      .Latency   ( 1              )
++    ) bank_sram_pri2_i (
++      .clk_i,
++      .rst_ni,
++      .req_i   (  additional_mem_pri_slave.req          ),
++      .we_i    ( ~additional_mem_pri_slave.wen          ),
++      .addr_i  (  pri2_address[PRI1_MEM_ADDR_WIDTH+1:2] ), //Convert from byte to word addressing
++      .wdata_i (  additional_mem_pri_slave.wdata        ),
++      .be_i    (  additional_mem_pri_slave.be           ),
++      .rdata_o (  additional_mem_pri_slave.r_rdata      )
++    );
++   
+ 
+ endmodule // l2_ram_multi_bank
+diff --git a/rtl/pulp_soc/pulp_soc.sv b/rtl/pulp_soc/pulp_soc.sv
+index ad091a6..2cefdab 100644
+--- a/rtl/pulp_soc/pulp_soc.sv
++++ b/rtl/pulp_soc/pulp_soc.sv
+@@ -214,7 +214,7 @@ module pulp_soc import dm::*; #(
+     localparam NB_L2_BANKS = `NB_L2_CHANNELS;
+     //The L2 parameter do not influence the size of the memories. Change them in the l2_ram_multibank. This parameters
+     //are only here to save area in the uDMA by only storing relevant bits.
+-    localparam L2_BANK_SIZE          = 32768;            // in 32-bit words
++    localparam L2_BANK_SIZE          = 65536;            // in 32-bit words
+     localparam L2_MEM_ADDR_WIDTH     = $clog2(L2_BANK_SIZE * NB_L2_BANKS) - $clog2(NB_L2_BANKS);    // 2**L2_MEM_ADDR_WIDTH rows (64bit each) in L2 --> TOTAL L2 SIZE = 8byte * 2^L2_MEM_ADDR_WIDTH
+     localparam NB_L2_BANKS_PRI       = 2;
+ 
+@@ -388,6 +388,7 @@ module pulp_soc import dm::*; #(
+ 
+     XBAR_TCDM_BUS  s_mem_l2_bus[NB_L2_BANKS-1:0]();
+     XBAR_TCDM_BUS  s_mem_l2_pri_bus[NB_L2_BANKS_PRI-1:0]();
++    XBAR_TCDM_BUS  s_mem_l2_additional_pri_bus();
+ 
+     XBAR_TCDM_BUS s_lint_debug_bus();
+     XBAR_TCDM_BUS s_lint_pulp_jtag_bus();
+@@ -545,12 +546,13 @@ module pulp_soc import dm::*; #(
+         .NB_BANKS              ( NB_L2_BANKS  ),
+         .BANK_SIZE_INTL_SRAM   ( L2_BANK_SIZE )
+     ) l2_ram_i (
+-        .clk_i           ( s_soc_clk          ),
+-        .rst_ni          ( s_soc_rstn         ),
+-        .init_ni         ( 1'b1               ),
+-        .test_mode_i     ( dft_test_mode_i    ),
+-        .mem_slave       ( s_mem_l2_bus       ),
+-        .mem_pri_slave   ( s_mem_l2_pri_bus   )
++        .clk_i                    ( s_soc_clk                   ),
++        .rst_ni                   ( s_soc_rstn                  ),
++        .init_ni                  ( 1'b1                        ),
++        .test_mode_i              ( dft_test_mode_i             ),
++        .mem_slave                ( s_mem_l2_bus                ),
++        .mem_pri_slave            ( s_mem_l2_pri_bus            ),
++        .additional_mem_pri_slave ( s_mem_l2_additional_pri_bus )
+     );
+ 
+ 
+@@ -836,21 +838,22 @@ module pulp_soc import dm::*; #(
+       .AXI_IN_ID_WIDTH(AXI_ID_IN_WIDTH),
+       .AXI_USER_WIDTH(AXI_USER_WIDTH)
+     ) i_soc_interconnect_wrap (
+-        .clk_i                 ( s_soc_clk           ),
+-        .rst_ni                ( s_soc_rstn          ),
+-        .test_en_i             ( dft_test_mode_i     ),
+-        .tcdm_fc_data          ( s_lint_fc_data_bus  ),
+-        .tcdm_fc_instr         ( s_lint_fc_instr_bus ),
+-        .tcdm_udma_rx          ( s_lint_udma_rx_bus  ),
+-        .tcdm_udma_tx          ( s_lint_udma_tx_bus  ),
+-        .tcdm_debug            ( s_lint_debug_bus    ),
+-        .tcdm_hwpe             ( s_lint_hwpe_bus     ),
+-        .axi_master_plug       ( s_data_in_bus       ),
+-        .axi_slave_plug        ( s_data_out_bus      ),
+-        .apb_peripheral_bus    ( s_apb_periph_bus    ),
+-        .l2_interleaved_slaves ( s_mem_l2_bus        ),
+-        .l2_private_slaves     ( s_mem_l2_pri_bus    ),
+-        .boot_rom_slave        ( s_mem_rom_bus       )
++        .clk_i                        ( s_soc_clk                   ),
++        .rst_ni                       ( s_soc_rstn                  ),
++        .test_en_i                    ( dft_test_mode_i             ),
++        .tcdm_fc_data                 ( s_lint_fc_data_bus          ),
++        .tcdm_fc_instr                ( s_lint_fc_instr_bus         ),
++        .tcdm_udma_rx                 ( s_lint_udma_rx_bus          ),
++        .tcdm_udma_tx                 ( s_lint_udma_tx_bus          ),
++        .tcdm_debug                   ( s_lint_debug_bus            ),
++        .tcdm_hwpe                    ( s_lint_hwpe_bus             ),
++        .axi_master_plug              ( s_data_in_bus               ),
++        .axi_slave_plug               ( s_data_out_bus              ),
++        .apb_peripheral_bus           ( s_apb_periph_bus            ),
++        .l2_interleaved_slaves        ( s_mem_l2_bus                ),
++        .l2_private_slaves            ( s_mem_l2_pri_bus            ),
++        .boot_rom_slave               ( s_mem_rom_bus               ),
++        .l2_additional_private_slaves ( s_mem_l2_additional_pri_bus )
+         );
+ 
+     /* Debug Subsystem */
+diff --git a/rtl/pulp_soc/soc_interconnect_wrap.sv b/rtl/pulp_soc/soc_interconnect_wrap.sv
+index 6218f48..68cafc5 100644
+--- a/rtl/pulp_soc/soc_interconnect_wrap.sv
++++ b/rtl/pulp_soc/soc_interconnect_wrap.sv
+@@ -56,7 +56,8 @@ module soc_interconnect_wrap
+        APB_BUS.Master           apb_peripheral_bus, // Connects to all the SoC Peripherals
+        XBAR_TCDM_BUS.Master     l2_interleaved_slaves[NR_L2_PORTS], // Connects to the interleaved memory banks
+        XBAR_TCDM_BUS.Master     l2_private_slaves[2], // Connects to core-private memory banks
+-       XBAR_TCDM_BUS.Master     boot_rom_slave //Connects to the bootrom
++       XBAR_TCDM_BUS.Master     boot_rom_slave, //Connects to the bootrom
++       XBAR_TCDM_BUS.Master     l2_additional_private_slaves
+      );
+ 
+     //**Do not change these values unles you verified that all downstream IPs are properly parametrized and support it**
+@@ -92,10 +93,11 @@ module soc_interconnect_wrap
+     ////////////////////////////////////////
+     // Address Rules for the interconnect //
+     ////////////////////////////////////////
+-    localparam NR_RULES_L2_DEMUX = 3;
++    localparam NR_RULES_L2_DEMUX = 4;
+     //Everything that is not routed to port 1 or 2 ends up in port 0 by default
+     localparam addr_map_rule_t [NR_RULES_L2_DEMUX-1:0] L2_DEMUX_RULES = '{
+        '{ idx: 1 , start_addr: `SOC_MEM_MAP_PRIVATE_BANK0_START_ADDR , end_addr: `SOC_MEM_MAP_PRIVATE_BANK1_END_ADDR} , //Both , bank0 and bank1 are in the  same address block
++       '{ idx: 1 , start_addr: `SOC_MEM_MAP_PRIVATE_BANK2_START_ADDR , end_addr: `SOC_MEM_MAP_PRIVATE_BANK2_END_ADDR} , //Additional private bank will be in the contigous (not interleaved) space
+        '{ idx: 1 , start_addr: `SOC_MEM_MAP_BOOT_ROM_START_ADDR      , end_addr: `SOC_MEM_MAP_BOOT_ROM_END_ADDR}      ,
+        '{ idx: 2 , start_addr: `SOC_MEM_MAP_TCDM_START_ADDR          , end_addr: `SOC_MEM_MAP_TCDM_END_ADDR }};
+ 
+@@ -103,11 +105,12 @@ module soc_interconnect_wrap
+     localparam addr_map_rule_t [NR_RULES_INTERLEAVED_REGION-1:0] INTERLEAVED_ADDR_SPACE = '{
+        '{ idx: 1 , start_addr: `SOC_MEM_MAP_TCDM_START_ADDR          , end_addr: `SOC_MEM_MAP_TCDM_END_ADDR }};
+ 
+-    localparam NR_RULES_CONTIG_CROSSBAR = 3;
++    localparam NR_RULES_CONTIG_CROSSBAR = 4;
+     localparam addr_map_rule_t [NR_RULES_CONTIG_CROSSBAR-1:0] CONTIGUOUS_CROSSBAR_RULES = '{
+         '{ idx: 0 , start_addr: `SOC_MEM_MAP_PRIVATE_BANK0_START_ADDR , end_addr: `SOC_MEM_MAP_PRIVATE_BANK0_END_ADDR} ,
+         '{ idx: 1 , start_addr: `SOC_MEM_MAP_PRIVATE_BANK1_START_ADDR , end_addr: `SOC_MEM_MAP_PRIVATE_BANK1_END_ADDR} ,
+-        '{ idx: 2 , start_addr: `SOC_MEM_MAP_BOOT_ROM_START_ADDR      , end_addr: `SOC_MEM_MAP_BOOT_ROM_END_ADDR}};
++        '{ idx: 2 , start_addr: `SOC_MEM_MAP_BOOT_ROM_START_ADDR      , end_addr: `SOC_MEM_MAP_BOOT_ROM_END_ADDR     },
++        '{ idx: 3 , start_addr: `SOC_MEM_MAP_PRIVATE_BANK2_START_ADDR , end_addr: `SOC_MEM_MAP_PRIVATE_BANK2_END_ADDR}};
+ 
+     localparam NR_RULES_AXI_CROSSBAR = 2;
+     localparam addr_map_rule_t [NR_RULES_AXI_CROSSBAR-1:0] AXI_CROSSBAR_RULES = '{
+@@ -166,10 +169,11 @@ module soc_interconnect_wrap
+         `TCDM_ASSIGN_INTF(master_ports[`NR_SOC_TCDM_MASTER_PORTS + i], axi_bridge_2_interconnect[i])
+     end
+ 
+-    XBAR_TCDM_BUS contiguous_slaves[3]();
++    XBAR_TCDM_BUS contiguous_slaves[4]();
+     `TCDM_ASSIGN_INTF(l2_private_slaves[0], contiguous_slaves[0])
+     `TCDM_ASSIGN_INTF(l2_private_slaves[1], contiguous_slaves[1])
+     `TCDM_ASSIGN_INTF(boot_rom_slave, contiguous_slaves[2])
++    `TCDM_ASSIGN_INTF(l2_additional_private_slaves, contiguous_slaves[3])
+ 
+     AXI_BUS #(.AXI_ADDR_WIDTH(32),
+               .AXI_DATA_WIDTH(32),
+@@ -188,7 +192,7 @@ module soc_interconnect_wrap
+                        .NR_ADDR_RULES_L2_DEMUX(NR_RULES_L2_DEMUX),
+                        .NR_SLAVE_PORTS_INTERLEAVED(NR_L2_PORTS), // Number of interleaved memory banks
+                        .NR_ADDR_RULES_SLAVE_PORTS_INTLVD(NR_RULES_INTERLEAVED_REGION),
+-                       .NR_SLAVE_PORTS_CONTIG(3), // Bootrom + number of private memory banks (normally 1 for
++                       .NR_SLAVE_PORTS_CONTIG(4), // Bootrom + number of private memory banks (normally 1 for
+                                                   // programm instructions and 1 for programm stack )
+                        .NR_ADDR_RULES_SLAVE_PORTS_CONTIG(NR_RULES_CONTIG_CROSSBAR),
+                        .NR_AXI_SLAVE_PORTS(2), // 1 for AXI to cluster, 1 for SoC peripherals (converted to APB)
